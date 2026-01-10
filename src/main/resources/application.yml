@@ -1,0 +1,41 @@
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/tradingdb?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    username: root
+    password: 123456
+  # 初始化数据库脚本
+  sql:
+    init:
+      schema-locations: classpath:schema.sql
+
+# MyBatis Plus配置（使用默认配置，只配置必要的）
+mybatis-plus:
+  # 实体类包路径
+  type-aliases-package: com.example.tradingsystem.domain
+  # Mapper XML文件位置（如果使用XML）
+  mapper-locations: classpath*:/mapper/**/*.xml
+  configuration:
+    # 开启驼峰命名转换
+    map-underscore-to-camel-case: true
+    # 日志实现
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    db-config:
+      # 主键类型：AUTO-数据库自增
+      id-type: auto
+      # 逻辑删除字段名（如果使用）
+      # logic-delete-field: deleted
+      # 逻辑删除值
+      # logic-delete-value: 1
+      # 逻辑未删除值
+      # logic-not-delete-value: 0
+
+# 日志配置
+logging:
+  level:
+    com.example.tradingsystem: debug
+
+# 服务器配置
+server:
+  port: 8080
