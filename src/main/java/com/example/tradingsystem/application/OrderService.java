@@ -10,12 +10,15 @@ import com.example.tradingsystem.domain.product.Product;
 import com.example.tradingsystem.domain.shared.DomainEventPublisher;
 import com.example.tradingsystem.domain.shared.Quantity;
 import com.example.tradingsystem.domain.user.UserAccount;
+import com.example.tradingsystem.infrastructure.lock.DistributedLock;
 import com.example.tradingsystem.repository.MerchantAccountRepository;
 import com.example.tradingsystem.repository.OrderRepository;
 import com.example.tradingsystem.repository.ProductRepository;
 import com.example.tradingsystem.repository.UserAccountRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
+import java.util.concurrent.TimeUnit;
 
 /**
  * 订单应用服务
@@ -35,19 +38,22 @@ public class OrderService {
     private final OrderRepository orderRepository;
     private final OrderDomainService orderDomainService;
     private final DomainEventPublisher domainEventPublisher;
+    private final DistributedLock distributedLock;
 
     public OrderService(UserAccountRepository userAccountRepository,
                         MerchantAccountRepository merchantAccountRepository,
                         ProductRepository productRepository,
                         OrderRepository orderRepository,
                         OrderDomainService orderDomainService,
-                        DomainEventPublisher domainEventPublisher) {
+                        DomainEventPublisher domainEventPublisher,
+                        DistributedLock distributedLock) {
         this.userAccountRepository = userAccountRepository;
         this.merchantAccountRepository = merchantAccountRepository;
         this.productRepository = productRepository;
         this.orderRepository = orderRepository;
         this.orderDomainService = orderDomainService;
         this.domainEventPublisher = domainEventPublisher;
+        this.distributedLock = distributedLock;
     }
 
     /**
@@ -72,58 +78,48 @@ public class OrderService {
      */
     @Transactional
     public Order placeOrder(String username, String sku, long quantity) {
-        // 1. 加载聚合根
-        UserAccount user = userAccountRepository.selectOne(
-                new LambdaQueryWrapper<UserAccount>()
-                        .eq(UserAccount::getUsername, username)
-        );
-        if (user == null) {
-            throw new ResourceNotFoundException("User not found: " + username);
+        // 生成分布式锁键
+        String lockKey = "order:product:" + sku;
+        
+        // 尝试获取分布式锁
+        boolean locked = distributedLock.tryLock(lockKey, 5, TimeUnit.SECONDS);
+        if (!locked) {
+            throw new ConcurrentUpdateException("System busy, please try again later");
         }
         
-        Product product = productRepository.selectOne(
-                new LambdaQueryWrapper<Product>()
-                        .eq(Product::getSku, sku)
-        );
-        if (product == null) {
-            throw new ResourceNotFoundException("Product not found: " + sku);
-        }
-        
-        // 加载商家
-        MerchantAccount merchant = merchantAccountRepository.selectById(product.getMerchantId());
-        if (merchant == null) {
-            throw new ResourceNotFoundException("Merchant not found: " + product.getMerchantId());
-        }
-        
-        // 设置关联对象（用于业务逻辑）
-        product.setMerchant(merchant);
-
-        // 2. 创建订单聚合根
-        Order order = new Order(user, merchant, product, Quantity.of(quantity));
-        orderRepository.insert(order); // 先保存以获取ID
-
-        // 3. 发布订单创建事件
-        domainEventPublisher.publish(new OrderPlacedEvent(
-                order.getId(),
-                user.getUsername(),
-                merchant.getName(),
-                product.getSku(),
-                order.getQuantity().getValue(),
-                order.getTotalPrice()
-        ));
-
         try {
-            // 4. 使用领域服务执行订单交易（跨聚合协调）
-            orderDomainService.executeOrder(order, user, merchant, product);
+            // 1. 加载聚合根
+            UserAccount user = userAccountRepository.selectOne(
+                    new LambdaQueryWrapper<UserAccount>()
+                            .eq(UserAccount::getUsername, username)
+            );
+            if (user == null) {
+                throw new ResourceNotFoundException("User not found: " + username);
+            }
+            
+            Product product = productRepository.selectOne(
+                    new LambdaQueryWrapper<Product>()
+                            .eq(Product::getSku, sku)
+            );
+            if (product == null) {
+                throw new ResourceNotFoundException("Product not found: " + sku);
+            }
+            
+            // 加载商家
+            MerchantAccount merchant = merchantAccountRepository.selectById(product.getMerchantId());
+            if (merchant == null) {
+                throw new ResourceNotFoundException("Merchant not found: " + product.getMerchantId());
+            }
+            
+            // 设置关联对象（用于业务逻辑）
+            product.setMerchant(merchant);
 
-            // 5. 保存聚合根状态
-            productRepository.updateById(product);
-            userAccountRepository.updateById(user);
-            merchantAccountRepository.updateById(merchant);
-            orderRepository.updateById(order);
+            // 2. 创建订单聚合根
+            Order order = new Order(user, merchant, product, Quantity.of(quantity));
+            orderRepository.insert(order); // 先保存以获取ID
 
-            // 6. 发布订单完成事件
-            domainEventPublisher.publish(new OrderCompletedEvent(
+            // 3. 发布订单创建事件
+            domainEventPublisher.publish(new OrderPlacedEvent(
                     order.getId(),
                     user.getUsername(),
                     merchant.getName(),
@@ -132,11 +128,35 @@ public class OrderService {
                     order.getTotalPrice()
             ));
 
-            return order;
-        } catch (RuntimeException ex) {
-            order.markFailed();
-            orderRepository.updateById(order);
-            throw ex;
+            try {
+                // 4. 使用领域服务执行订单交易（跨聚合协调）
+                orderDomainService.executeOrder(order, user, merchant, product);
+
+                // 5. 保存聚合根状态
+                productRepository.updateById(product);
+                userAccountRepository.updateById(user);
+                merchantAccountRepository.updateById(merchant);
+                orderRepository.updateById(order);
+
+                // 6. 发布订单完成事件
+                domainEventPublisher.publish(new OrderCompletedEvent(
+                        order.getId(),
+                        user.getUsername(),
+                        merchant.getName(),
+                        product.getSku(),
+                        order.getQuantity().getValue(),
+                        order.getTotalPrice()
+                ));
+
+                return order;
+            } catch (RuntimeException ex) {
+                order.markFailed();
+                orderRepository.updateById(order);
+                throw ex;
+            }
+        } finally {
+            // 释放分布式锁
+            distributedLock.unlock(lockKey);
         }
     }
 
